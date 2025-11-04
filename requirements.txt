@@ -1,0 +1,5 @@
+requests>=2.31.0
+schedule>=1.2.0
+hyperliquid-python-sdk>=0.20.0
+python-telegram-bot>=20.0
+
