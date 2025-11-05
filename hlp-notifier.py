@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 import asyncio
 
@@ -91,13 +91,13 @@ def get_all_vault_depositors(vault_address):
                 return data
             return []
         elif response.status_code == 401:
-            print("Vaults-analyser authentication error: Invalid or expired token")
+            print("vaults-analyser authentication error: Invalid or expired token")
             return None
         elif response.status_code == 404:
             print("Vault not found on vaults-analyser")
             return None
         else:
-            print(f"Vaults-analyser API error: {response.status_code} - {response.text[:200]}")
+            print(f"vaults-analyser API error: {response.status_code} - {response.text[:200]}")
             return None
             
     except requests.exceptions.RequestException as e:
@@ -108,13 +108,12 @@ def get_all_vault_depositors(vault_address):
         return None
 
 def get_user_vault_position(wallet_address, vault_data=None):
-    """Retrieves user position in HLP vault using Hyperliquid SDK"""
+    """Retrieves your position in the HLP vault using Hyperliquid SDK"""
     vault_address = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
     
     # Use Hyperliquid SDK to get current value (most reliable method)
     equity_from_sdk = None
     locked_until = 0
-    first_deposit_timestamp = None
     try:
         info = Info(constants.MAINNET_API_URL, skip_ws=True)
         vault_equities = info.user_vault_equities(wallet_address)
@@ -128,8 +127,6 @@ def get_user_vault_position(wallet_address, vault_data=None):
                         try:
                             equity_from_sdk = float(equity) if isinstance(equity, str) else equity
                             locked_until = vault_info.get('lockedUntilTimestamp', 0)
-                            # Try to get first deposit timestamp from vault info
-                            first_deposit_timestamp = vault_info.get('firstDepositTimestamp', None)
                             break
                         except (ValueError, TypeError) as e:
                             print(f"Conversion error: {e}")
@@ -141,68 +138,30 @@ def get_user_vault_position(wallet_address, vault_data=None):
     if equity_from_sdk is not None:
         initial_deposit = None
         
-        # Try vaults-analyser first to get initial deposit and timestamp
+        # Try vaults-analyser first to get initial deposit
         all_depositors = get_all_vault_depositors(vault_address)
         if all_depositors:
             for depositor in all_depositors:
                 if isinstance(depositor, dict) and depositor.get('user', '').lower() == wallet_address.lower():
                     vault_equity_va = depositor.get('vault_equity', None)
                     all_time_pnl_va = depositor.get('all_time_pnl', None)
-                    # Try to get first deposit timestamp from vaults-analyser
-                    if first_deposit_timestamp is None:
-                        first_deposit_timestamp = depositor.get('first_deposit_timestamp', None) or depositor.get('firstDepositTimestamp', None)
-                    
                     if vault_equity_va is not None and all_time_pnl_va is not None:
                         try:
                             vault_equity_va = float(vault_equity_va) if isinstance(vault_equity_va, str) else vault_equity_va
                             all_time_pnl_va = float(all_time_pnl_va) if isinstance(all_time_pnl_va, str) else all_time_pnl_va
+                            initial_deposit = vault_equity_va - all_time_pnl_va
                             
-                            # Logic: current_equity = initial_deposit + total_pnl
-                            # From vaults-analyser: vault_equity_va = initial_deposit + all_time_pnl_va
-                            # So: initial_deposit = vault_equity_va - all_time_pnl_va
-                            
-                            # Use SDK equity (more accurate) with all_time_pnl_va from vaults-analyser
-                            # This gives: initial_deposit = equity_from_sdk - all_time_pnl_va
-                            initial_deposit = equity_from_sdk - all_time_pnl_va
-                            
-                            # Fallback: if calculation gives negative or zero, use vault_equity_va
-                            if initial_deposit <= 0:
-                                print(f"Warning: initial_deposit from SDK={initial_deposit}, using vault_equity_va calculation")
-                                initial_deposit = vault_equity_va - all_time_pnl_va
-                            
-                            # Ensure we have a valid initial_deposit
-                            if initial_deposit <= 0:
-                                print(f"Error: Cannot calculate valid initial_deposit. vault_equity_va={vault_equity_va}, all_time_pnl_va={all_time_pnl_va}, equity_from_sdk={equity_from_sdk}")
-                                initial_deposit = None
-                            
-                            # Use all_time_pnl_va directly as total PnL (from vaults-analyser)
-                            total_pnl_calculated = all_time_pnl_va
-                            
-                            # Debug logging
-                            print(f"Debug calculation:")
-                            print(f"  equity_from_sdk (current): {equity_from_sdk}")
-                            print(f"  vault_equity_va (from vaults-analyser): {vault_equity_va}")
-                            print(f"  all_time_pnl_va (total PnL): {all_time_pnl_va}")
-                            print(f"  initial_deposit (calculated): {initial_deposit}")
-                            print(f"  total_pnl_calculated: {total_pnl_calculated}")
-                            print(f"  first_deposit_timestamp: {first_deposit_timestamp}")
-                            
-                            # Verify percentage calculation
-                            if initial_deposit and initial_deposit > 0 and total_pnl_calculated is not None:
-                                expected_percent = (total_pnl_calculated / initial_deposit) * 100
-                                print(f"  Expected percentage: {expected_percent:.2f}%")
+                            total_pnl_calculated = equity_from_sdk - initial_deposit
                             
                             return {
                                 'equity': equity_from_sdk,
                                 'lockedUntil': locked_until,
                                 'pnl': depositor.get('pnl', 0),
                                 'allTimePnl': total_pnl_calculated,
-                                'initialDeposit': initial_deposit,
-                                'firstDepositTimestamp': first_deposit_timestamp
+                                'initialDeposit': initial_deposit
                             }
                         except (ValueError, TypeError) as e:
-                            print(f"Error calculating initial deposit: {e}")
-                            print(f"  vault_equity_va={vault_equity_va}, all_time_pnl_va={all_time_pnl_va}, equity_from_sdk={equity_from_sdk}")
+                            print(f"Initial deposit calculation error: {e}")
                     break
         
         # Try followers list (top 100) as fallback
@@ -225,21 +184,19 @@ def get_user_vault_position(wallet_address, vault_data=None):
                                     'lockedUntil': locked_until,
                                     'pnl': follower.get('pnl', 0),
                                     'allTimePnl': total_pnl_calculated,
-                                    'initialDeposit': initial_deposit,
-                                    'firstDepositTimestamp': first_deposit_timestamp
+                                    'initialDeposit': initial_deposit
                                 }
                             except (ValueError, TypeError):
                                 pass
                         break
         
-        # If initial deposit not found, return anyway with equity
+        # If initial deposit not found, return with equity anyway
         return {
             'equity': equity_from_sdk,
             'lockedUntil': locked_until,
             'pnl': 0,
             'allTimePnl': None,
-            'initialDeposit': None,
-            'firstDepositTimestamp': first_deposit_timestamp
+            'initialDeposit': None
         }
     
     # Fallback 1: Search in followers list (top 100)
@@ -254,11 +211,10 @@ def get_user_vault_position(wallet_address, vault_data=None):
                         return {
                             'equity': equity_float,
                             'pnl': follower.get('pnl', 0),
-                            'allTimePnl': follower.get('allTimePnl', 0),
-                            'firstDepositTimestamp': None
+                            'allTimePnl': follower.get('allTimePnl', 0)
                         }
                     except (ValueError, TypeError):
-                        return {'equity': 0, 'pnl': 0, 'allTimePnl': 0, 'firstDepositTimestamp': None}
+                        return {'equity': 0, 'pnl': 0, 'allTimePnl': 0}
     
     # Fallback 2: Try vaults-analyser (may not be up to date)
     all_depositors = get_all_vault_depositors(vault_address)
@@ -266,18 +222,12 @@ def get_user_vault_position(wallet_address, vault_data=None):
         for depositor in all_depositors:
             if isinstance(depositor, dict) and depositor.get('user', '').lower() == wallet_address.lower():
                 vault_equity = depositor.get('vault_equity', 0)
-                all_time_pnl = depositor.get('all_time_pnl', 0)
-                first_deposit_ts = depositor.get('first_deposit_timestamp', None) or depositor.get('firstDepositTimestamp', None) or depositor.get('created_at', None)
                 try:
                     equity_float = float(vault_equity) if isinstance(vault_equity, str) else vault_equity
-                    all_time_pnl_float = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
-                    initial_deposit = equity_float - all_time_pnl_float if equity_float > 0 and all_time_pnl_float is not None else None
                     return {
                         'equity': equity_float,
                         'pnl': depositor.get('pnl', 0),
-                        'allTimePnl': all_time_pnl_float,
-                        'initialDeposit': initial_deposit,
-                        'firstDepositTimestamp': first_deposit_ts
+                        'allTimePnl': depositor.get('all_time_pnl', 0)
                     }
                 except (ValueError, TypeError):
                     pass
@@ -384,54 +334,6 @@ def extract_vault_metrics(vault_data):
     
     return metrics
 
-def format_duration_since_first_deposit(first_deposit_timestamp):
-    """Format duration since first deposit in a human-readable format"""
-    if not first_deposit_timestamp:
-        return None
-    
-    try:
-        # Convert timestamp to datetime (handle both Unix timestamp in seconds or milliseconds)
-        if isinstance(first_deposit_timestamp, str):
-            first_deposit_timestamp = float(first_deposit_timestamp)
-        
-        # If timestamp is in milliseconds, convert to seconds
-        if first_deposit_timestamp > 1e10:
-            first_deposit_timestamp = first_deposit_timestamp / 1000
-        
-        first_deposit_date = datetime.fromtimestamp(first_deposit_timestamp)
-        now = datetime.now()
-        delta = now - first_deposit_date
-        
-        days = delta.days
-        hours = delta.seconds // 3600
-        minutes = (delta.seconds % 3600) // 60
-        
-        if days > 365:
-            years = days // 365
-            remaining_days = days % 365
-            if years == 1:
-                return f"{years} year, {remaining_days} days"
-            return f"{years} years, {remaining_days} days"
-        elif days > 30:
-            months = days // 30
-            remaining_days = days % 30
-            if months == 1:
-                return f"{months} month, {remaining_days} days"
-            return f"{months} months, {remaining_days} days"
-        elif days > 0:
-            if days == 1:
-                return f"{days} day, {hours}h"
-            return f"{days} days, {hours}h"
-        elif hours > 0:
-            if hours == 1:
-                return f"{hours} hour, {minutes}m"
-            return f"{hours} hours, {minutes}m"
-        else:
-            return f"{minutes} minutes"
-    except Exception as e:
-        print(f"Error formatting duration: {e}")
-        return None
-
 def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent):
     """Formats the performance message"""
     today = datetime.now().strftime("%m/%d/%Y")
@@ -442,11 +344,6 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
     user_emoji = "✅" if user_pnl > 0 else "❌" if user_pnl < 0 else "➖"
     
     tvl_str = f"${vault_metrics['tvl']:,.2f}" if vault_metrics['tvl'] > 0 else "N/A"
-    
-    # Initialize variables
-    equity_str = "N/A"
-    total_pnl_str = "N/A"
-    duration_line = ""
     
     if user_data and isinstance(user_data, dict):
         user_equity = user_data.get('equity', 0)
@@ -459,75 +356,30 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
         
         all_time_pnl = user_data.get('allTimePnl', None)
         initial_deposit = user_data.get('initialDeposit', None)
-        first_deposit_timestamp = user_data.get('firstDepositTimestamp', None)
         
-        # Calculate duration since first deposit
-        duration_str = format_duration_since_first_deposit(first_deposit_timestamp)
-        
-        # Try to get timestamp from vault history if not available
-        if not duration_str and vault_data and isinstance(vault_data, dict):
-            portfolio = vault_data.get('portfolio', [])
-            for period_data in portfolio:
-                if isinstance(period_data, list) and len(period_data) >= 2:
-                    period_name = period_data[0]
-                    period_info = period_data[1]
-                    if period_name == 'allTime' and isinstance(period_info, dict):
-                        pnl_history = period_info.get('pnlHistory', [])
-                        if pnl_history and len(pnl_history) > 0:
-                            # Get first timestamp from PnL history
-                            first_entry = pnl_history[0]
-                            if isinstance(first_entry, list) and len(first_entry) >= 2:
-                                first_deposit_timestamp = first_entry[0]
-                                duration_str = format_duration_since_first_deposit(first_deposit_timestamp)
-                        break
-        
-        if duration_str:
-            duration_line = f"• Duration since first deposit: {duration_str}"
-        
-        # Debug logging
-        print(f"Debug - all_time_pnl: {all_time_pnl}, initial_deposit: {initial_deposit}, first_deposit_timestamp: {first_deposit_timestamp}, equity: {user_equity}, duration_str: {duration_str}")
-        
-        # Try to calculate initial deposit if not available but we have equity and PnL
-        if initial_deposit is None and all_time_pnl is not None and user_equity > 0:
+        if all_time_pnl is not None and initial_deposit is not None and initial_deposit > 0:
             try:
                 all_time_pnl = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
-                # Estimate initial deposit: current equity - total PnL
-                initial_deposit = user_equity - all_time_pnl
-                if initial_deposit > 0:
-                    print(f"Estimated initial_deposit: {initial_deposit} (from equity={user_equity} - pnl={all_time_pnl})")
-                else:
-                    print(f"Warning: Cannot estimate initial_deposit (equity={user_equity}, pnl={all_time_pnl})")
-            except (ValueError, TypeError) as e:
-                print(f"Error estimating initial_deposit: {e}")
-        
-        if all_time_pnl is not None:
-            try:
-                all_time_pnl = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
+                initial_deposit = float(initial_deposit) if isinstance(initial_deposit, str) else initial_deposit
                 
-                if initial_deposit is not None and initial_deposit > 0:
-                    initial_deposit = float(initial_deposit) if isinstance(initial_deposit, str) else initial_deposit
-                    # Calculate percentage - ensure values are valid
-                    if initial_deposit > 0 and all_time_pnl != 0:
-                        all_time_pnl_percent = (all_time_pnl / initial_deposit) * 100
-                        total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
-                        total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} ({all_time_pnl_percent:+.2f}%)"
-                        print(f"Final PnL display: {total_pnl_str}, percent={all_time_pnl_percent:.2f}%")
-                    else:
-                        # PnL is zero or initial_deposit invalid
-                        total_pnl_emoji = "➖"
-                        total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} (0.00%)"
-                else:
-                    # No initial deposit available, show PnL without percentage
-                    total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
-                    total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f}"
-                    print(f"No initial_deposit available, showing PnL only: {total_pnl_str}")
-            except (ValueError, TypeError) as e:
-                print(f"Error formatting PnL: {e}, all_time_pnl={all_time_pnl}, initial_deposit={initial_deposit}")
+                all_time_pnl_percent = (all_time_pnl / initial_deposit) * 100
+                total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
+                total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} ({all_time_pnl_percent:+.2f}%)"
+            except (ValueError, TypeError):
+                total_pnl_str = "N/A"
+        elif all_time_pnl is not None:
+            try:
+                all_time_pnl = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
+                total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
+                total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f}"
+            except (ValueError, TypeError):
                 total_pnl_str = "N/A"
         else:
             total_pnl_str = "N/A"
+    else:
+        equity_str = "N/A"
+        total_pnl_str = "N/A"
     
-    # Build message with duration on separate line
     message = f"""
 <b>🏦 HLP Vault Performance - {today}</b>
 
@@ -538,17 +390,8 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
 <b>💼 Your Position:</b>
 • Value: {equity_str}
 • 24h PnL: {user_emoji} ${user_pnl:,.2f} ({user_pnl_percent:+.2f}%)
-• Total PnL: {total_pnl_str}"""
-    
-    # Add duration line if available
-    if duration_line:
-        message += f"\n{duration_line}"
-    
-    # Add warning if position not found
-    if not user_data:
-        message += "\n\n⚠️ Position not found. Please verify that your address is correct and that you have funds in the HLP vault."
-    
-    message += "\n"
+• Total PnL: {total_pnl_str}{("" if user_data else "\n\n⚠️ Position not found. Please verify that your address is correct and that you have funds in the HLP vault.")}
+"""
     return message
 
 async def generate_report(wallet_address):
@@ -580,9 +423,9 @@ async def generate_report(wallet_address):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command"""
     keyboard = [
-        [InlineKeyboardButton("📝 Set my address", callback_data='set_address')],
-        [InlineKeyboardButton("📊 Get report", callback_data='get_report')],
-        [InlineKeyboardButton("ℹ️ View my address", callback_data='view_address')]
+        [InlineKeyboardButton("📝 Set My Address", callback_data='set_address')],
+        [InlineKeyboardButton("📊 Get Report", callback_data='get_report')],
+        [InlineKeyboardButton("ℹ️ View My Address", callback_data='view_address')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -593,7 +436,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text += "This bot allows you to track your performance in the Hyperliquid HLP vault.\n\n"
     
     if current_address:
-        welcome_text += f"📍 <b>Registered address:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
+        welcome_text += f"📍 <b>Registered Address:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
     else:
         welcome_text += "⚠️ <b>No address registered.</b> Please set your address to get started.\n\n"
     
@@ -606,7 +449,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles button clicks in the menu"""
+    """Handles clicks on menu buttons"""
     query = update.callback_query
     await query.answer()
     
@@ -626,8 +469,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if not current_address:
             keyboard = [
-                [InlineKeyboardButton("📝 Set my address", callback_data='set_address')],
-                [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
+                [InlineKeyboardButton("📝 Set My Address", callback_data='set_address')],
+                [InlineKeyboardButton("◀️ Back to Menu", callback_data='back_to_menu')]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -645,7 +488,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [
             [InlineKeyboardButton("🔄 Refresh", callback_data='get_report')],
-            [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
+            [InlineKeyboardButton("◀️ Back to Menu", callback_data='back_to_menu')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -659,14 +502,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_address = user_addresses.get(user_id, None)
         
         keyboard = [
-            [InlineKeyboardButton("✏️ Edit address", callback_data='set_address')],
-            [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
+            [InlineKeyboardButton("✏️ Edit Address", callback_data='set_address')],
+            [InlineKeyboardButton("◀️ Back to Menu", callback_data='back_to_menu')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         if current_address:
             await query.edit_message_text(
-                f"📍 <b>Your registered address:</b>\n\n"
+                f"📍 <b>Your Registered Address:</b>\n\n"
                 f"<code>{current_address}</code>",
                 reply_markup=reply_markup,
                 parse_mode='HTML'
@@ -681,9 +524,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == 'back_to_menu':
         keyboard = [
-            [InlineKeyboardButton("📝 Set my address", callback_data='set_address')],
-            [InlineKeyboardButton("📊 Get report", callback_data='get_report')],
-            [InlineKeyboardButton("ℹ️ View my address", callback_data='view_address')]
+            [InlineKeyboardButton("📝 Set My Address", callback_data='set_address')],
+            [InlineKeyboardButton("📊 Get Report", callback_data='get_report')],
+            [InlineKeyboardButton("ℹ️ View My Address", callback_data='view_address')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -692,7 +535,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_text = "👋 <b>Main Menu</b>\n\n"
         
         if current_address:
-            welcome_text += f"📍 <b>Registered address:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
+            welcome_text += f"📍 <b>Registered Address:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
         else:
             welcome_text += "⚠️ <b>No address registered.</b> Please set your address to get started.\n\n"
         
@@ -720,31 +563,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Save the address
+        # Save address
         user_addresses[user_id] = address
         save_user_addresses()
         
         context.user_data['waiting_for_address'] = False
         
         keyboard = [
-            [InlineKeyboardButton("📊 Get report", callback_data='get_report')],
-            [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
+            [InlineKeyboardButton("📊 Get Report", callback_data='get_report')],
+            [InlineKeyboardButton("◀️ Back to Menu", callback_data='back_to_menu')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            f"✅ <b>Address saved successfully!</b>\n\n"
+            f"✅ <b>Address registered successfully!</b>\n\n"
             f"Address: <code>{address}</code>\n\n"
             "You can now get your performance report.",
             reply_markup=reply_markup,
             parse_mode='HTML'
         )
     else:
-        # If user sends a message without context, show the menu
+        # If user sends a message without context, show menu
         keyboard = [
-            [InlineKeyboardButton("📝 Set my address", callback_data='set_address')],
-            [InlineKeyboardButton("📊 Get report", callback_data='get_report')],
-            [InlineKeyboardButton("ℹ️ View my address", callback_data='view_address')]
+            [InlineKeyboardButton("📝 Set My Address", callback_data='set_address')],
+            [InlineKeyboardButton("📊 Get Report", callback_data='get_report')],
+            [InlineKeyboardButton("ℹ️ View My Address", callback_data='view_address')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -759,7 +602,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 <b>📖 Help - HLP Performance Tracker Bot</b>
 
-<b>Available commands:</b>
+<b>Available Commands:</b>
 /start - Show main menu
 /help - Show this help
 /report - Get your performance report (requires a registered address)
@@ -767,11 +610,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>Features:</b>
 • Track your performance in the Hyperliquid HLP vault
 • View your daily and total PnL
-• See global vault metrics
+• Visualize global vault metrics
 
 <b>How to use:</b>
 1. Set your wallet address via the menu
-2. Use "Get report" to see your performance
+2. Use "Get Report" to see your performance
 3. Refresh the report at any time
 
 <b>Note:</b> If your position doesn't appear, please verify that your address is correct and that you have funds in the HLP vault.
@@ -785,7 +628,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not current_address:
         keyboard = [
-            [InlineKeyboardButton("📝 Set my address", callback_data='set_address')]
+            [InlineKeyboardButton("📝 Set My Address", callback_data='set_address')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -803,7 +646,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("🔄 Refresh", callback_data='get_report')],
-        [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
+        [InlineKeyboardButton("◀️ Back to Menu", callback_data='back_to_menu')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -824,19 +667,6 @@ def main():
     # Create Telegram application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Configure bot commands for menu
-    async def post_init(app: Application) -> None:
-        """Configure bot commands after initialization"""
-        commands = [
-            BotCommand("start", "Show main menu"),
-            BotCommand("help", "Show help and instructions"),
-            BotCommand("report", "Get your HLP performance report"),
-        ]
-        await app.bot.set_my_commands(commands)
-        print("✅ Bot commands menu configured")
-    
-    application.post_init = post_init
-    
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -844,8 +674,8 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Start the bot
-    print("Bot running...")
+    # Start bot
+    print("Bot is running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
