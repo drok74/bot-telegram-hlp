@@ -156,9 +156,22 @@ def get_user_vault_position(wallet_address, vault_data=None):
                         try:
                             vault_equity_va = float(vault_equity_va) if isinstance(vault_equity_va, str) else vault_equity_va
                             all_time_pnl_va = float(all_time_pnl_va) if isinstance(all_time_pnl_va, str) else all_time_pnl_va
+                            
+                            # Calculate initial deposit: current equity - total PnL = initial deposit
+                            # But we use vault_equity_va from vaults-analyser which might differ from SDK equity
+                            # So we calculate: initial_deposit = vault_equity_va - all_time_pnl_va
                             initial_deposit = vault_equity_va - all_time_pnl_va
                             
+                            # But we should use the SDK equity (more accurate) for current value
+                            # So total PnL = current equity (SDK) - initial deposit
                             total_pnl_calculated = equity_from_sdk - initial_deposit
+                            
+                            # Ensure initial_deposit is positive and reasonable
+                            if initial_deposit <= 0:
+                                print(f"Warning: initial_deposit calculated as {initial_deposit}, using alternative calculation")
+                                # Alternative: use SDK equity and all_time_pnl_va from vaults-analyser
+                                initial_deposit = equity_from_sdk - all_time_pnl_va
+                                total_pnl_calculated = all_time_pnl_va
                             
                             return {
                                 'equity': equity_from_sdk,
@@ -170,6 +183,7 @@ def get_user_vault_position(wallet_address, vault_data=None):
                             }
                         except (ValueError, TypeError) as e:
                             print(f"Error calculating initial deposit: {e}")
+                            print(f"  vault_equity_va={vault_equity_va}, all_time_pnl_va={all_time_pnl_va}, equity_from_sdk={equity_from_sdk}")
                     break
         
         # Try followers list (top 100) as fallback
@@ -233,13 +247,17 @@ def get_user_vault_position(wallet_address, vault_data=None):
         for depositor in all_depositors:
             if isinstance(depositor, dict) and depositor.get('user', '').lower() == wallet_address.lower():
                 vault_equity = depositor.get('vault_equity', 0)
-                first_deposit_ts = depositor.get('first_deposit_timestamp', None) or depositor.get('firstDepositTimestamp', None)
+                all_time_pnl = depositor.get('all_time_pnl', 0)
+                first_deposit_ts = depositor.get('first_deposit_timestamp', None) or depositor.get('firstDepositTimestamp', None) or depositor.get('created_at', None)
                 try:
                     equity_float = float(vault_equity) if isinstance(vault_equity, str) else vault_equity
+                    all_time_pnl_float = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
+                    initial_deposit = equity_float - all_time_pnl_float if equity_float > 0 and all_time_pnl_float is not None else None
                     return {
                         'equity': equity_float,
                         'pnl': depositor.get('pnl', 0),
-                        'allTimePnl': depositor.get('all_time_pnl', 0),
+                        'allTimePnl': all_time_pnl_float,
+                        'initialDeposit': initial_deposit,
                         'firstDepositTimestamp': first_deposit_ts
                     }
                 except (ValueError, TypeError):
@@ -406,6 +424,11 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
     
     tvl_str = f"${vault_metrics['tvl']:,.2f}" if vault_metrics['tvl'] > 0 else "N/A"
     
+    # Initialize variables
+    equity_str = "N/A"
+    total_pnl_str = "N/A"
+    duration_line = ""
+    
     if user_data and isinstance(user_data, dict):
         user_equity = user_data.get('equity', 0)
         if isinstance(user_equity, str):
@@ -421,36 +444,42 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
         
         # Calculate duration since first deposit
         duration_str = format_duration_since_first_deposit(first_deposit_timestamp)
+        if duration_str:
+            duration_line = f"• Duration since first deposit: {duration_str}"
         
-        if all_time_pnl is not None and initial_deposit is not None and initial_deposit > 0:
+        # Debug logging
+        print(f"Debug - all_time_pnl: {all_time_pnl}, initial_deposit: {initial_deposit}, first_deposit_timestamp: {first_deposit_timestamp}, equity: {user_equity}")
+        
+        # Try to calculate initial deposit if not available but we have equity and PnL
+        if initial_deposit is None and all_time_pnl is not None and user_equity > 0:
             try:
                 all_time_pnl = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
-                initial_deposit = float(initial_deposit) if isinstance(initial_deposit, str) else initial_deposit
-                
-                all_time_pnl_percent = (all_time_pnl / initial_deposit) * 100
-                total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
-                total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} ({all_time_pnl_percent:+.2f}%)"
-                
-                # Add duration info if available
-                if duration_str:
-                    total_pnl_str += f"\n• Duration: {duration_str}"
+                # Estimate initial deposit: current equity - total PnL
+                initial_deposit = user_equity - all_time_pnl
+                if initial_deposit > 0:
+                    print(f"Estimated initial_deposit: {initial_deposit}")
             except (ValueError, TypeError):
-                total_pnl_str = "N/A"
-        elif all_time_pnl is not None:
+                pass
+        
+        if all_time_pnl is not None:
             try:
                 all_time_pnl = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
-                total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
-                total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f}"
-                if duration_str:
-                    total_pnl_str += f"\n• Duration: {duration_str}"
-            except (ValueError, TypeError):
+                
+                if initial_deposit is not None and initial_deposit > 0:
+                    initial_deposit = float(initial_deposit) if isinstance(initial_deposit, str) else initial_deposit
+                    # Calculate percentage
+                    all_time_pnl_percent = (all_time_pnl / initial_deposit) * 100
+                    total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
+                    total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} ({all_time_pnl_percent:+.2f}%)"
+                else:
+                    # No initial deposit available, show PnL without percentage
+                    total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
+                    total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f}"
+            except (ValueError, TypeError) as e:
+                print(f"Error formatting PnL: {e}, all_time_pnl={all_time_pnl}, initial_deposit={initial_deposit}")
                 total_pnl_str = "N/A"
-        else:
-            total_pnl_str = "N/A"
-    else:
-        equity_str = "N/A"
-        total_pnl_str = "N/A"
     
+    # Build message with duration on separate line
     message = f"""
 <b>🏦 HLP Vault Performance - {today}</b>
 
@@ -461,8 +490,17 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
 <b>💼 Your Position:</b>
 • Value: {equity_str}
 • 24h PnL: {user_emoji} ${user_pnl:,.2f} ({user_pnl_percent:+.2f}%)
-• Total PnL: {total_pnl_str}{("" if user_data else "\n\n⚠️ Position not found. Please verify that your address is correct and that you have funds in the HLP vault.")}
-"""
+• Total PnL: {total_pnl_str}"""
+    
+    # Add duration line if available
+    if duration_line:
+        message += f"\n{duration_line}"
+    
+    # Add warning if position not found
+    if not user_data:
+        message += "\n\n⚠️ Position not found. Please verify that your address is correct and that you have funds in the HLP vault."
+    
+    message += "\n"
     return message
 
 async def generate_report(wallet_address):
