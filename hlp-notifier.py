@@ -1,7 +1,7 @@
 import requests
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -137,14 +137,18 @@ def get_user_vault_position(wallet_address, vault_data=None):
     # If we have SDK value, retrieve initial deposit from vaults-analyser to calculate total PnL
     if equity_from_sdk is not None:
         initial_deposit = None
+        all_time_pnl_calculated = None
         
         # Try vaults-analyser first to get initial deposit
         all_depositors = get_all_vault_depositors(vault_address)
         if all_depositors:
+            print(f"DEBUG: Found {len(all_depositors)} depositors from vaults-analyser")
             for depositor in all_depositors:
                 if isinstance(depositor, dict) and depositor.get('user', '').lower() == wallet_address.lower():
+                    print(f"DEBUG: Found user in vaults-analyser: {depositor}")
                     vault_equity_va = depositor.get('vault_equity', None)
                     all_time_pnl_va = depositor.get('all_time_pnl', None)
+                    print(f"DEBUG: vault_equity_va={vault_equity_va}, all_time_pnl_va={all_time_pnl_va}")
                     if vault_equity_va is not None and all_time_pnl_va is not None:
                         try:
                             vault_equity_va = float(vault_equity_va) if isinstance(vault_equity_va, str) else vault_equity_va
@@ -152,6 +156,8 @@ def get_user_vault_position(wallet_address, vault_data=None):
                             initial_deposit = vault_equity_va - all_time_pnl_va
                             
                             total_pnl_calculated = equity_from_sdk - initial_deposit
+                            
+                            print(f"DEBUG: Calculated initial_deposit={initial_deposit}, total_pnl_calculated={total_pnl_calculated}")
                             
                             return {
                                 'equity': equity_from_sdk,
@@ -163,6 +169,8 @@ def get_user_vault_position(wallet_address, vault_data=None):
                         except (ValueError, TypeError) as e:
                             print(f"Initial deposit calculation error: {e}")
                     break
+        else:
+            print("DEBUG: No depositors found from vaults-analyser")
         
         # Try followers list (top 100) as fallback
         if initial_deposit is None and vault_data and isinstance(vault_data, dict):
@@ -235,7 +243,7 @@ def get_user_vault_position(wallet_address, vault_data=None):
     return None
 
 def extract_vault_metrics(vault_data):
-    """Extracts vault metrics from API data"""
+    """Extracts vault metrics from API data (rolling 24h)"""
     metrics = {
         'tvl': 0,
         'daily_pnl_percent': 0,
@@ -334,16 +342,176 @@ def extract_vault_metrics(vault_data):
     
     return metrics
 
-def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent):
+def extract_yesterday_vault_metrics(vault_data):
+    """Extracts vault metrics for yesterday's calendar day (00:00 to 23:59)"""
+    metrics = {
+        'tvl': 0,
+        'yesterday_pnl_percent': 0,
+        'yesterday_pnl_amount': 0,
+        'yesterday_start_value': 0,
+        'yesterday_end_value': 0
+    }
+    
+    try:
+        # Get yesterday's date range (00:00 to 23:59:59) in UTC
+        now = datetime.now(timezone.utc)
+        yesterday_date = (now - timedelta(days=1)).date()
+        
+        yesterday_start = datetime.combine(
+            yesterday_date,
+            datetime.min.time(),
+            timezone.utc
+        )
+        yesterday_end = datetime.combine(
+            yesterday_date,
+            datetime.max.time(),
+            timezone.utc
+        )
+        
+        # Convert to milliseconds (timestamp format used by API)
+        yesterday_start_ms = int(yesterday_start.timestamp() * 1000)
+        yesterday_end_ms = int(yesterday_end.timestamp() * 1000)
+        
+        portfolio = vault_data.get('portfolio', [])
+        day_data = None
+        alltime_data = None
+        
+        # Try to get data from 'day' period first, then 'allTime'
+        for period_data in portfolio:
+            if isinstance(period_data, list) and len(period_data) >= 2:
+                period_name = period_data[0]
+                period_info = period_data[1]
+                
+                if period_name == 'day' and isinstance(period_info, dict):
+                    day_data = period_info
+                elif period_name == 'allTime' and isinstance(period_info, dict):
+                    alltime_data = period_info
+        
+        # Try to find yesterday's data in day_data first
+        data_source = day_data if day_data else alltime_data
+        
+        if data_source:
+            account_history = data_source.get('accountValueHistory', [])
+            pnl_history = data_source.get('pnlHistory', [])
+            
+            # Filter data for yesterday only
+            yesterday_account_history = []
+            yesterday_pnl_history = []
+            
+            for entry in account_history:
+                if isinstance(entry, list) and len(entry) >= 2:
+                    timestamp = entry[0]
+                    if yesterday_start_ms <= timestamp <= yesterday_end_ms:
+                        yesterday_account_history.append(entry)
+            
+            for entry in pnl_history:
+                if isinstance(entry, list) and len(entry) >= 2:
+                    timestamp = entry[0]
+                    if yesterday_start_ms <= timestamp <= yesterday_end_ms:
+                        yesterday_pnl_history.append(entry)
+            
+            # Calculate using pnlHistory (preferred method)
+            if yesterday_pnl_history and len(yesterday_pnl_history) >= 2:
+                first_pnl = float(yesterday_pnl_history[0][1])
+                last_pnl = float(yesterday_pnl_history[-1][1])
+                metrics['yesterday_pnl_amount'] = last_pnl - first_pnl
+                
+                if yesterday_account_history and len(yesterday_account_history) >= 1:
+                    first_value = float(yesterday_account_history[0][1])
+                    metrics['yesterday_start_value'] = first_value
+                    if first_value > 0:
+                        metrics['yesterday_pnl_percent'] = (metrics['yesterday_pnl_amount'] / first_value) * 100
+                    
+                    # Get end value
+                    if len(yesterday_account_history) >= 1:
+                        metrics['yesterday_end_value'] = float(yesterday_account_history[-1][1])
+                        metrics['tvl'] = metrics['yesterday_end_value']
+            
+            # Fallback: use accountValueHistory
+            elif yesterday_account_history and len(yesterday_account_history) >= 2:
+                first_entry = yesterday_account_history[0]
+                last_entry = yesterday_account_history[-1]
+                if (isinstance(first_entry, list) and len(first_entry) >= 2 and
+                    isinstance(last_entry, list) and len(last_entry) >= 2):
+                    first_value = float(first_entry[1])
+                    last_value = float(last_entry[1])
+                    metrics['yesterday_start_value'] = first_value
+                    metrics['yesterday_end_value'] = last_value
+                    metrics['tvl'] = last_value
+                    metrics['yesterday_pnl_amount'] = last_value - first_value
+                    
+                    if first_value > 0:
+                        metrics['yesterday_pnl_percent'] = ((last_value - first_value) / first_value) * 100
+            
+            # If no data found for yesterday in filtered data, try to get closest values
+            elif account_history and len(account_history) >= 2:
+                # Find entries closest to yesterday start and end
+                closest_start_entry = None
+                closest_end_entry = None
+                min_start_diff = float('inf')
+                min_end_diff = float('inf')
+                
+                for entry in account_history:
+                    if isinstance(entry, list) and len(entry) >= 2:
+                        timestamp = entry[0]
+                        start_diff = abs(timestamp - yesterday_start_ms)
+                        end_diff = abs(timestamp - yesterday_end_ms)
+                        
+                        if start_diff < min_start_diff:
+                            min_start_diff = start_diff
+                            closest_start_entry = entry
+                        
+                        if end_diff < min_end_diff:
+                            min_end_diff = end_diff
+                            closest_end_entry = entry
+                
+                # Use closest entries if within reasonable time range (within 6 hours)
+                if closest_start_entry and closest_end_entry:
+                    start_timestamp = closest_start_entry[0]
+                    end_timestamp = closest_end_entry[0]
+                    
+                    # Check if entries are reasonably close to yesterday's boundaries
+                    if (abs(start_timestamp - yesterday_start_ms) < 6 * 60 * 60 * 1000 and
+                        abs(end_timestamp - yesterday_end_ms) < 6 * 60 * 60 * 1000):
+                        
+                        first_value = float(closest_start_entry[1])
+                        last_value = float(closest_end_entry[1])
+                        metrics['yesterday_start_value'] = first_value
+                        metrics['yesterday_end_value'] = last_value
+                        metrics['tvl'] = last_value
+                        metrics['yesterday_pnl_amount'] = last_value - first_value
+                        
+                        if first_value > 0:
+                            metrics['yesterday_pnl_percent'] = ((last_value - first_value) / first_value) * 100
+        
+    except Exception as e:
+        print(f"Error extracting yesterday metrics: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return metrics
+
+def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent, yesterday_metrics=None):
     """Formats the performance message"""
     today = datetime.now().strftime("%m/%d/%Y")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%m/%d/%Y")
     
-    vault_metrics = extract_vault_metrics(vault_data)
+    # Use yesterday metrics if available
+    if yesterday_metrics and yesterday_metrics.get('yesterday_pnl_percent', 0) != 0:
+        vault_pnl_percent = yesterday_metrics.get('yesterday_pnl_percent', 0)
+        vault_tvl = yesterday_metrics.get('tvl', 0)
+        period_label = f"Yesterday ({yesterday})"
+    else:
+        # Fallback to rolling 24h
+        vault_metrics = extract_vault_metrics(vault_data)
+        vault_pnl_percent = vault_metrics['daily_pnl_percent']
+        vault_tvl = vault_metrics['tvl']
+        period_label = "Last 24h (Rolling)"
     
-    vault_emoji = "📈" if vault_metrics['daily_pnl_percent'] > 0 else "📉"
+    vault_emoji = "📈" if vault_pnl_percent > 0 else "📉"
     user_emoji = "✅" if user_pnl > 0 else "❌" if user_pnl < 0 else "➖"
     
-    tvl_str = f"${vault_metrics['tvl']:,.2f}" if vault_metrics['tvl'] > 0 else "N/A"
+    tvl_str = f"${vault_tvl:,.2f}" if vault_tvl > 0 else "N/A"
     
     if user_data and isinstance(user_data, dict):
         user_equity = user_data.get('equity', 0)
@@ -357,6 +525,11 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
         all_time_pnl = user_data.get('allTimePnl', None)
         initial_deposit = user_data.get('initialDeposit', None)
         
+        # Debug logging
+        print(f"DEBUG format_performance_message: user_equity={user_equity}, all_time_pnl={all_time_pnl}, initial_deposit={initial_deposit}")
+        
+        # Calculate Total PnL: same method as v1
+        # Priority: use allTimePnl if available, otherwise calculate from current_value - initialDeposit
         if all_time_pnl is not None and initial_deposit is not None and initial_deposit > 0:
             try:
                 all_time_pnl = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
@@ -365,31 +538,53 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
                 all_time_pnl_percent = (all_time_pnl / initial_deposit) * 100
                 total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
                 total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} ({all_time_pnl_percent:+.2f}%)"
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                print(f"DEBUG: Error formatting total PnL with deposit: {e}")
                 total_pnl_str = "N/A"
         elif all_time_pnl is not None:
             try:
                 all_time_pnl = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
+                # Show Total PnL even if zero
                 total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
                 total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f}"
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                print(f"DEBUG: Error formatting total PnL without deposit: {e}")
+                total_pnl_str = "N/A"
+        elif initial_deposit is not None and user_equity > 0:
+            # Fallback: calculate Total PnL from current_value - initialDeposit (same as v1)
+            try:
+                initial_deposit = float(initial_deposit) if isinstance(initial_deposit, str) else initial_deposit
+                calculated_total_pnl = user_equity - initial_deposit
+                if initial_deposit > 0:
+                    calculated_total_pnl_percent = (calculated_total_pnl / initial_deposit) * 100
+                    total_pnl_emoji = "✅" if calculated_total_pnl > 0 else "❌" if calculated_total_pnl < 0 else "➖"
+                    total_pnl_str = f"{total_pnl_emoji} ${calculated_total_pnl:,.2f} ({calculated_total_pnl_percent:+.2f}%)"
+                else:
+                    total_pnl_emoji = "✅" if calculated_total_pnl > 0 else "❌" if calculated_total_pnl < 0 else "➖"
+                    total_pnl_str = f"{total_pnl_emoji} ${calculated_total_pnl:,.2f}"
+                print(f"DEBUG: Calculated Total PnL from current_value - initialDeposit: {calculated_total_pnl}")
+            except (ValueError, TypeError) as e:
+                print(f"DEBUG: Error calculating total PnL from deposit: {e}")
                 total_pnl_str = "N/A"
         else:
+            print(f"DEBUG: all_time_pnl is None and cannot calculate from initialDeposit")
             total_pnl_str = "N/A"
     else:
         equity_str = "N/A"
         total_pnl_str = "N/A"
     
+    pnl_label = "Yesterday PnL" if yesterday_metrics and yesterday_metrics.get('yesterday_pnl_percent', 0) != 0 else "24h PnL"
+    
     message = f"""
 <b>🏦 HLP Vault Performance - {today}</b>
 
-<b>📊 Global Vault:</b>
+<b>📊 Global Vault ({period_label}):</b>
 • TVL: {tvl_str}
-• 24h Performance: {vault_emoji} {vault_metrics['daily_pnl_percent']:.2f}%
+• Performance: {vault_emoji} {vault_pnl_percent:.2f}%
 
 <b>💼 Your Position:</b>
-• Value: {equity_str}
-• 24h PnL: {user_emoji} ${user_pnl:,.2f} ({user_pnl_percent:+.2f}%)
+• Current Value: {equity_str}
+• {pnl_label}: {user_emoji} ${user_pnl:,.2f} ({user_pnl_percent:+.2f}%)
 • Total PnL: {total_pnl_str}{("" if user_data else "\n\n⚠️ Position not found. Please verify that your address is correct and that you have funds in the HLP vault.")}
 """
     return message
@@ -402,8 +597,11 @@ async def generate_report(wallet_address):
         return "⚠️ Error retrieving vault data"
     
     user_data = get_user_vault_position(wallet_address, vault_data)
-    vault_metrics = extract_vault_metrics(vault_data)
     
+    # Get yesterday's metrics (calendar day)
+    yesterday_metrics = extract_yesterday_vault_metrics(vault_data)
+    
+    # Calculate user's PnL for yesterday
     if user_data and isinstance(user_data, dict):
         current_value = user_data.get('equity', 0)
         if isinstance(current_value, str):
@@ -414,10 +612,58 @@ async def generate_report(wallet_address):
     else:
         current_value = 0
     
-    user_pnl = current_value * (vault_metrics['daily_pnl_percent'] / 100) if current_value > 0 else 0
-    user_pnl_percent = vault_metrics['daily_pnl_percent']
+    # Calculate yesterday's PnL
+    # Use yesterday's vault performance to estimate user's PnL
+    if yesterday_metrics.get('yesterday_pnl_percent', 0) != 0:
+        # Use yesterday's vault performance percentage
+        user_yesterday_pnl_percent = yesterday_metrics['yesterday_pnl_percent']
+        
+        # Calculate user's PnL for yesterday
+        # To be accurate, we need to estimate the user's position value at the END of yesterday
+        # Then apply yesterday's performance to get the PnL
+        
+        vault_yesterday_end = yesterday_metrics.get('yesterday_end_value', 0)
+        
+        # Get current vault TVL
+        vault_metrics_current = extract_vault_metrics(vault_data)
+        vault_current = vault_metrics_current.get('tvl', 0)
+        
+        if current_value > 0 and vault_yesterday_end > 0 and vault_current > 0:
+            # Estimate user's position value at end of yesterday
+            # By scaling proportionally: user_end_yesterday / user_current = vault_end_yesterday / vault_current
+            # So: user_end_yesterday = user_current * (vault_end_yesterday / vault_current)
+            estimated_user_end_yesterday = current_value * (vault_yesterday_end / vault_current)
+            
+            # Calculate PnL: if performance was X%, then:
+            # value_end = value_start * (1 + X%)
+            # So: value_start = value_end / (1 + X%)
+            # PnL = value_end - value_start = value_end - value_end/(1+X%) = value_end * (X% / (1+X%))
+            
+            if user_yesterday_pnl_percent != -100:  # Avoid division by zero
+                estimated_user_start_yesterday = estimated_user_end_yesterday / (1 + user_yesterday_pnl_percent / 100)
+                user_yesterday_pnl = estimated_user_end_yesterday - estimated_user_start_yesterday
+            else:
+                # If -100%, everything was lost
+                user_yesterday_pnl = -estimated_user_end_yesterday
+        elif current_value > 0:
+            # Fallback: use simple proportional method (same as v1 but with yesterday's %)
+            user_yesterday_pnl = current_value * (user_yesterday_pnl_percent / 100)
+        else:
+            user_yesterday_pnl = 0
+    else:
+        # Fallback: use rolling 24h metrics if yesterday data not available
+        vault_metrics = extract_vault_metrics(vault_data)
+        user_yesterday_pnl = current_value * (vault_metrics['daily_pnl_percent'] / 100) if current_value > 0 else 0
+        user_yesterday_pnl_percent = vault_metrics['daily_pnl_percent']
+        yesterday_metrics = None  # Mark as unavailable
     
-    message = format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent)
+    message = format_performance_message(
+        vault_data, 
+        user_data, 
+        user_yesterday_pnl, 
+        user_yesterday_pnl_percent,
+        yesterday_metrics=yesterday_metrics
+    )
     return message
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -434,6 +680,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     welcome_text = "👋 <b>Welcome to the HLP Performance Tracker Bot!</b>\n\n"
     welcome_text += "This bot allows you to track your performance in the Hyperliquid HLP vault.\n\n"
+    welcome_text += "<b>🆕 NEW:</b> Reports now show yesterday's performance (calendar day)!\n\n"
     
     if current_address:
         welcome_text += f"📍 <b>Registered Address:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
@@ -611,6 +858,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Track your performance in the Hyperliquid HLP vault
 • View your daily and total PnL
 • Visualize global vault metrics
+• <b>NEW:</b> Reports show yesterday's calendar day performance
 
 <b>How to use:</b>
 1. Set your wallet address via the menu
@@ -658,7 +906,8 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Main function"""
-    print("HLP Performance Tracker Bot started")
+    print("HLP Performance Tracker Bot v2 started")
+    print("NEW: Calculates yesterday's calendar day performance")
     
     # Load saved addresses
     load_user_addresses()
