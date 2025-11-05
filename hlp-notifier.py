@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 import asyncio
 
@@ -19,57 +19,57 @@ if not TELEGRAM_BOT_TOKEN:
 HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
 VAULTS_ANALYSER_API = "https://vaults-analyser.com/pub_api/v1"
 
-# Token pour vaults-analyser.com (optionnel)
+# Token for vaults-analyser.com (optional)
 VAULTS_ANALYSER_TOKEN = os.getenv("VAULTS_ANALYSER_TOKEN")
 
-# Fichier pour stocker les adresses des utilisateurs
+# File to store user addresses
 USER_ADDRESSES_FILE = "user_addresses.json"
 
-# Dictionnaire pour stocker les adresses des utilisateurs (user_id -> address)
+# Dictionary to store user addresses (user_id -> address)
 user_addresses = {}
 
 def load_user_addresses():
-    """Charge les adresses depuis le fichier JSON"""
+    """Load addresses from JSON file"""
     global user_addresses
     try:
         if os.path.exists(USER_ADDRESSES_FILE):
             with open(USER_ADDRESSES_FILE, 'r') as f:
                 user_addresses = json.load(f)
     except Exception as e:
-        print(f"Erreur lors du chargement des adresses: {e}")
+        print(f"Error loading addresses: {e}")
         user_addresses = {}
 
 def save_user_addresses():
-    """Sauvegarde les adresses dans le fichier JSON"""
+    """Save addresses to JSON file"""
     try:
         with open(USER_ADDRESSES_FILE, 'w') as f:
             json.dump(user_addresses, f, indent=2)
     except Exception as e:
-        print(f"Erreur lors de la sauvegarde des adresses: {e}")
+        print(f"Error saving addresses: {e}")
 
 def get_hlp_vault_performance():
-    """Récupère les données du vault HLP"""
+    """Retrieves HLP vault data"""
     try:
         payload = {
             "type": "vaultDetails",
-            "vaultAddress": "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"  # Adresse du vault HLP
+            "vaultAddress": "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"  # HLP vault address
         }
         response = requests.post(HYPERLIQUID_API, json=payload)
         response.raise_for_status()
         data = response.json()
         return data
     except requests.exceptions.RequestException as e:
-        print(f"Erreur lors de la récupération des données du vault: {e}")
+        print(f"Error retrieving vault data: {e}")
         if hasattr(e, 'response') and e.response is not None:
             print(f"Response status: {e.response.status_code}")
             print(f"Response text: {e.response.text[:200]}")
         return None
     except Exception as e:
-        print(f"Erreur lors de la récupération des données du vault: {e}")
+        print(f"Error retrieving vault data: {e}")
         return None
 
 def get_all_vault_depositors(vault_address):
-    """Récupère la liste complète de tous les déposants du vault via vaults-analyser.com"""
+    """Retrieves the complete list of all vault depositors via vaults-analyser.com"""
     if not VAULTS_ANALYSER_TOKEN:
         return None
     
@@ -91,29 +91,30 @@ def get_all_vault_depositors(vault_address):
                 return data
             return []
         elif response.status_code == 401:
-            print("Erreur d'authentification vaults-analyser: Token invalide ou expiré")
+            print("Vaults-analyser authentication error: Invalid or expired token")
             return None
         elif response.status_code == 404:
-            print("Vault non trouvé sur vaults-analyser")
+            print("Vault not found on vaults-analyser")
             return None
         else:
-            print(f"Erreur vaults-analyser API: {response.status_code} - {response.text[:200]}")
+            print(f"Vaults-analyser API error: {response.status_code} - {response.text[:200]}")
             return None
             
     except requests.exceptions.RequestException as e:
-        print(f"Erreur lors de la récupération des déposants depuis vaults-analyser: {e}")
+        print(f"Error retrieving depositors from vaults-analyser: {e}")
         return None
     except Exception as e:
-        print(f"Erreur inattendue: {e}")
+        print(f"Unexpected error: {e}")
         return None
 
 def get_user_vault_position(wallet_address, vault_data=None):
-    """Récupère votre position dans le vault HLP en utilisant le SDK Hyperliquid"""
+    """Retrieves user position in HLP vault using Hyperliquid SDK"""
     vault_address = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
     
-    # Utiliser le SDK Hyperliquid pour obtenir la valeur actuelle (méthode la plus fiable)
+    # Use Hyperliquid SDK to get current value (most reliable method)
     equity_from_sdk = None
     locked_until = 0
+    first_deposit_timestamp = None
     try:
         info = Info(constants.MAINNET_API_URL, skip_ws=True)
         vault_equities = info.user_vault_equities(wallet_address)
@@ -127,24 +128,30 @@ def get_user_vault_position(wallet_address, vault_data=None):
                         try:
                             equity_from_sdk = float(equity) if isinstance(equity, str) else equity
                             locked_until = vault_info.get('lockedUntilTimestamp', 0)
+                            # Try to get first deposit timestamp from vault info
+                            first_deposit_timestamp = vault_info.get('firstDepositTimestamp', None)
                             break
                         except (ValueError, TypeError) as e:
-                            print(f"Erreur de conversion: {e}")
+                            print(f"Conversion error: {e}")
                             return None
     except Exception as e:
-        print(f"Erreur SDK Hyperliquid: {e}")
+        print(f"Hyperliquid SDK error: {e}")
     
-    # Si on a la valeur du SDK, récupérer le dépôt initial depuis vaults-analyser pour calculer le PnL total
+    # If we have SDK value, retrieve initial deposit from vaults-analyser to calculate total PnL
     if equity_from_sdk is not None:
         initial_deposit = None
         
-        # Essayer d'abord vaults-analyser pour obtenir le dépôt initial
+        # Try vaults-analyser first to get initial deposit and timestamp
         all_depositors = get_all_vault_depositors(vault_address)
         if all_depositors:
             for depositor in all_depositors:
                 if isinstance(depositor, dict) and depositor.get('user', '').lower() == wallet_address.lower():
                     vault_equity_va = depositor.get('vault_equity', None)
                     all_time_pnl_va = depositor.get('all_time_pnl', None)
+                    # Try to get first deposit timestamp from vaults-analyser
+                    if first_deposit_timestamp is None:
+                        first_deposit_timestamp = depositor.get('first_deposit_timestamp', None) or depositor.get('firstDepositTimestamp', None)
+                    
                     if vault_equity_va is not None and all_time_pnl_va is not None:
                         try:
                             vault_equity_va = float(vault_equity_va) if isinstance(vault_equity_va, str) else vault_equity_va
@@ -158,13 +165,14 @@ def get_user_vault_position(wallet_address, vault_data=None):
                                 'lockedUntil': locked_until,
                                 'pnl': depositor.get('pnl', 0),
                                 'allTimePnl': total_pnl_calculated,
-                                'initialDeposit': initial_deposit
+                                'initialDeposit': initial_deposit,
+                                'firstDepositTimestamp': first_deposit_timestamp
                             }
                         except (ValueError, TypeError) as e:
-                            print(f"Erreur de calcul du dépôt initial: {e}")
+                            print(f"Error calculating initial deposit: {e}")
                     break
         
-        # Essayer dans followers list (top 100) comme fallback
+        # Try followers list (top 100) as fallback
         if initial_deposit is None and vault_data and isinstance(vault_data, dict):
             followers = vault_data.get('followers', [])
             if isinstance(followers, list):
@@ -184,22 +192,24 @@ def get_user_vault_position(wallet_address, vault_data=None):
                                     'lockedUntil': locked_until,
                                     'pnl': follower.get('pnl', 0),
                                     'allTimePnl': total_pnl_calculated,
-                                    'initialDeposit': initial_deposit
+                                    'initialDeposit': initial_deposit,
+                                    'firstDepositTimestamp': first_deposit_timestamp
                                 }
                             except (ValueError, TypeError):
                                 pass
                         break
         
-        # Si on n'a pas trouvé le dépôt initial, retourner quand même avec equity
+        # If initial deposit not found, return anyway with equity
         return {
             'equity': equity_from_sdk,
             'lockedUntil': locked_until,
             'pnl': 0,
             'allTimePnl': None,
-            'initialDeposit': None
+            'initialDeposit': None,
+            'firstDepositTimestamp': first_deposit_timestamp
         }
     
-    # Fallback 1: Chercher dans followers list (top 100)
+    # Fallback 1: Search in followers list (top 100)
     if vault_data and isinstance(vault_data, dict):
         followers = vault_data.get('followers', [])
         if isinstance(followers, list):
@@ -211,23 +221,26 @@ def get_user_vault_position(wallet_address, vault_data=None):
                         return {
                             'equity': equity_float,
                             'pnl': follower.get('pnl', 0),
-                            'allTimePnl': follower.get('allTimePnl', 0)
+                            'allTimePnl': follower.get('allTimePnl', 0),
+                            'firstDepositTimestamp': None
                         }
                     except (ValueError, TypeError):
-                        return {'equity': 0, 'pnl': 0, 'allTimePnl': 0}
+                        return {'equity': 0, 'pnl': 0, 'allTimePnl': 0, 'firstDepositTimestamp': None}
     
-    # Fallback 2: Essayer vaults-analyser (peut ne pas être à jour)
+    # Fallback 2: Try vaults-analyser (may not be up to date)
     all_depositors = get_all_vault_depositors(vault_address)
     if all_depositors:
         for depositor in all_depositors:
             if isinstance(depositor, dict) and depositor.get('user', '').lower() == wallet_address.lower():
                 vault_equity = depositor.get('vault_equity', 0)
+                first_deposit_ts = depositor.get('first_deposit_timestamp', None) or depositor.get('firstDepositTimestamp', None)
                 try:
                     equity_float = float(vault_equity) if isinstance(vault_equity, str) else vault_equity
                     return {
                         'equity': equity_float,
                         'pnl': depositor.get('pnl', 0),
-                        'allTimePnl': depositor.get('all_time_pnl', 0)
+                        'allTimePnl': depositor.get('all_time_pnl', 0),
+                        'firstDepositTimestamp': first_deposit_ts
                     }
                 except (ValueError, TypeError):
                     pass
@@ -235,7 +248,7 @@ def get_user_vault_position(wallet_address, vault_data=None):
     return None
 
 def extract_vault_metrics(vault_data):
-    """Extrait les métriques du vault depuis les données de l'API"""
+    """Extracts vault metrics from API data"""
     metrics = {
         'tvl': 0,
         'daily_pnl_percent': 0,
@@ -330,13 +343,61 @@ def extract_vault_metrics(vault_data):
                         metrics['apr'] = (total_return_percent / time_diff_days) * 365
         
     except Exception as e:
-        print(f"Erreur lors de l'extraction des métriques: {e}")
+        print(f"Error extracting metrics: {e}")
     
     return metrics
 
+def format_duration_since_first_deposit(first_deposit_timestamp):
+    """Format duration since first deposit in a human-readable format"""
+    if not first_deposit_timestamp:
+        return None
+    
+    try:
+        # Convert timestamp to datetime (handle both Unix timestamp in seconds or milliseconds)
+        if isinstance(first_deposit_timestamp, str):
+            first_deposit_timestamp = float(first_deposit_timestamp)
+        
+        # If timestamp is in milliseconds, convert to seconds
+        if first_deposit_timestamp > 1e10:
+            first_deposit_timestamp = first_deposit_timestamp / 1000
+        
+        first_deposit_date = datetime.fromtimestamp(first_deposit_timestamp)
+        now = datetime.now()
+        delta = now - first_deposit_date
+        
+        days = delta.days
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+        
+        if days > 365:
+            years = days // 365
+            remaining_days = days % 365
+            if years == 1:
+                return f"{years} year, {remaining_days} days"
+            return f"{years} years, {remaining_days} days"
+        elif days > 30:
+            months = days // 30
+            remaining_days = days % 30
+            if months == 1:
+                return f"{months} month, {remaining_days} days"
+            return f"{months} months, {remaining_days} days"
+        elif days > 0:
+            if days == 1:
+                return f"{days} day, {hours}h"
+            return f"{days} days, {hours}h"
+        elif hours > 0:
+            if hours == 1:
+                return f"{hours} hour, {minutes}m"
+            return f"{hours} hours, {minutes}m"
+        else:
+            return f"{minutes} minutes"
+    except Exception as e:
+        print(f"Error formatting duration: {e}")
+        return None
+
 def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent):
-    """Formate le message de performance"""
-    today = datetime.now().strftime("%d/%m/%Y")
+    """Formats the performance message"""
+    today = datetime.now().strftime("%m/%d/%Y")
     
     vault_metrics = extract_vault_metrics(vault_data)
     
@@ -356,6 +417,10 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
         
         all_time_pnl = user_data.get('allTimePnl', None)
         initial_deposit = user_data.get('initialDeposit', None)
+        first_deposit_timestamp = user_data.get('firstDepositTimestamp', None)
+        
+        # Calculate duration since first deposit
+        duration_str = format_duration_since_first_deposit(first_deposit_timestamp)
         
         if all_time_pnl is not None and initial_deposit is not None and initial_deposit > 0:
             try:
@@ -365,6 +430,10 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
                 all_time_pnl_percent = (all_time_pnl / initial_deposit) * 100
                 total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
                 total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} ({all_time_pnl_percent:+.2f}%)"
+                
+                # Add duration info if available
+                if duration_str:
+                    total_pnl_str += f"\n• Duration: {duration_str}"
             except (ValueError, TypeError):
                 total_pnl_str = "N/A"
         elif all_time_pnl is not None:
@@ -372,6 +441,8 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
                 all_time_pnl = float(all_time_pnl) if isinstance(all_time_pnl, str) else all_time_pnl
                 total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
                 total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f}"
+                if duration_str:
+                    total_pnl_str += f"\n• Duration: {duration_str}"
             except (ValueError, TypeError):
                 total_pnl_str = "N/A"
         else:
@@ -381,25 +452,25 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
         total_pnl_str = "N/A"
     
     message = f"""
-<b>🏦 Performance HLP Vault - {today}</b>
+<b>🏦 HLP Vault Performance - {today}</b>
 
-<b>📊 Vault Global:</b>
+<b>📊 Global Vault:</b>
 • TVL: {tvl_str}
-• Performance 24h: {vault_emoji} {vault_metrics['daily_pnl_percent']:.2f}%
+• 24h Performance: {vault_emoji} {vault_metrics['daily_pnl_percent']:.2f}%
 
-<b>💼 Votre Position:</b>
-• Valeur: {equity_str}
-• PnL 24h: {user_emoji} ${user_pnl:,.2f} ({user_pnl_percent:+.2f}%)
-• PnL Total: {total_pnl_str}{("" if user_data else "\n\n⚠️ Position non trouvée. Vérifiez que votre adresse est correcte et que vous avez des fonds dans le vault HLP.")}
+<b>💼 Your Position:</b>
+• Value: {equity_str}
+• 24h PnL: {user_emoji} ${user_pnl:,.2f} ({user_pnl_percent:+.2f}%)
+• Total PnL: {total_pnl_str}{("" if user_data else "\n\n⚠️ Position not found. Please verify that your address is correct and that you have funds in the HLP vault.")}
 """
     return message
 
 async def generate_report(wallet_address):
-    """Génère un rapport pour une adresse donnée"""
+    """Generates a report for a given address"""
     vault_data = get_hlp_vault_performance()
     
     if not vault_data:
-        return "⚠️ Erreur lors de la récupération des données du vault"
+        return "⚠️ Error retrieving vault data"
     
     user_data = get_user_vault_position(wallet_address, vault_data)
     vault_metrics = extract_vault_metrics(vault_data)
@@ -421,26 +492,26 @@ async def generate_report(wallet_address):
     return message
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère la commande /start"""
+    """Handles the /start command"""
     keyboard = [
-        [InlineKeyboardButton("📝 Définir mon adresse", callback_data='set_address')],
-        [InlineKeyboardButton("📊 Obtenir le rapport", callback_data='get_report')],
-        [InlineKeyboardButton("ℹ️ Voir mon adresse", callback_data='view_address')]
+        [InlineKeyboardButton("📝 Set my address", callback_data='set_address')],
+        [InlineKeyboardButton("📊 Get report", callback_data='get_report')],
+        [InlineKeyboardButton("ℹ️ View my address", callback_data='view_address')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     user_id = str(update.effective_user.id)
     current_address = user_addresses.get(user_id, None)
     
-    welcome_text = "👋 <b>Bienvenue sur le Bot HLP Performance Tracker!</b>\n\n"
-    welcome_text += "Ce bot vous permet de suivre votre performance dans le vault HLP d'Hyperliquid.\n\n"
+    welcome_text = "👋 <b>Welcome to the HLP Performance Tracker Bot!</b>\n\n"
+    welcome_text += "This bot allows you to track your performance in the Hyperliquid HLP vault.\n\n"
     
     if current_address:
-        welcome_text += f"📍 <b>Adresse enregistrée:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
+        welcome_text += f"📍 <b>Registered address:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
     else:
-        welcome_text += "⚠️ <b>Aucune adresse enregistrée.</b> Veuillez définir votre adresse pour commencer.\n\n"
+        welcome_text += "⚠️ <b>No address registered.</b> Please set your address to get started.\n\n"
     
-    welcome_text += "Utilisez le menu ci-dessous pour naviguer:"
+    welcome_text += "Use the menu below to navigate:"
     
     await update.message.reply_text(
         welcome_text,
@@ -449,7 +520,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère les clics sur les boutons du menu"""
+    """Handles button clicks in the menu"""
     query = update.callback_query
     await query.answer()
     
@@ -457,9 +528,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == 'set_address':
         await query.edit_message_text(
-            "📝 <b>Définition de l'adresse</b>\n\n"
-            "Veuillez envoyer votre adresse wallet Hyperliquid.\n\n"
-            "Format attendu: <code>0x...</code>",
+            "📝 <b>Set Address</b>\n\n"
+            "Please send your Hyperliquid wallet address.\n\n"
+            "Expected format: <code>0x...</code>",
             parse_mode='HTML'
         )
         context.user_data['waiting_for_address'] = True
@@ -469,26 +540,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if not current_address:
             keyboard = [
-                [InlineKeyboardButton("📝 Définir mon adresse", callback_data='set_address')],
-                [InlineKeyboardButton("◀️ Retour au menu", callback_data='back_to_menu')]
+                [InlineKeyboardButton("📝 Set my address", callback_data='set_address')],
+                [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await query.edit_message_text(
-                "⚠️ <b>Aucune adresse enregistrée</b>\n\n"
-                "Veuillez d'abord définir votre adresse wallet pour obtenir votre rapport.",
+                "⚠️ <b>No address registered</b>\n\n"
+                "Please set your wallet address first to get your report.",
                 reply_markup=reply_markup,
                 parse_mode='HTML'
             )
             return
         
-        await query.edit_message_text("⏳ <b>Récupération des données...</b>", parse_mode='HTML')
+        await query.edit_message_text("⏳ <b>Retrieving data...</b>", parse_mode='HTML')
         
         report = await generate_report(current_address)
         
         keyboard = [
-            [InlineKeyboardButton("🔄 Actualiser", callback_data='get_report')],
-            [InlineKeyboardButton("◀️ Retour au menu", callback_data='back_to_menu')]
+            [InlineKeyboardButton("🔄 Refresh", callback_data='get_report')],
+            [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -502,44 +573,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_address = user_addresses.get(user_id, None)
         
         keyboard = [
-            [InlineKeyboardButton("✏️ Modifier l'adresse", callback_data='set_address')],
-            [InlineKeyboardButton("◀️ Retour au menu", callback_data='back_to_menu')]
+            [InlineKeyboardButton("✏️ Edit address", callback_data='set_address')],
+            [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         if current_address:
             await query.edit_message_text(
-                f"📍 <b>Votre adresse enregistrée:</b>\n\n"
+                f"📍 <b>Your registered address:</b>\n\n"
                 f"<code>{current_address}</code>",
                 reply_markup=reply_markup,
                 parse_mode='HTML'
             )
         else:
             await query.edit_message_text(
-                "⚠️ <b>Aucune adresse enregistrée</b>\n\n"
-                "Veuillez définir votre adresse pour commencer.",
+                "⚠️ <b>No address registered</b>\n\n"
+                "Please set your address to get started.",
                 reply_markup=reply_markup,
                 parse_mode='HTML'
             )
     
     elif query.data == 'back_to_menu':
         keyboard = [
-            [InlineKeyboardButton("📝 Définir mon adresse", callback_data='set_address')],
-            [InlineKeyboardButton("📊 Obtenir le rapport", callback_data='get_report')],
-            [InlineKeyboardButton("ℹ️ Voir mon adresse", callback_data='view_address')]
+            [InlineKeyboardButton("📝 Set my address", callback_data='set_address')],
+            [InlineKeyboardButton("📊 Get report", callback_data='get_report')],
+            [InlineKeyboardButton("ℹ️ View my address", callback_data='view_address')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         current_address = user_addresses.get(user_id, None)
         
-        welcome_text = "👋 <b>Menu Principal</b>\n\n"
+        welcome_text = "👋 <b>Main Menu</b>\n\n"
         
         if current_address:
-            welcome_text += f"📍 <b>Adresse enregistrée:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
+            welcome_text += f"📍 <b>Registered address:</b> <code>{current_address[:10]}...{current_address[-8:]}</code>\n\n"
         else:
-            welcome_text += "⚠️ <b>Aucune adresse enregistrée.</b> Veuillez définir votre adresse pour commencer.\n\n"
+            welcome_text += "⚠️ <b>No address registered.</b> Please set your address to get started.\n\n"
         
-        welcome_text += "Utilisez le menu ci-dessous pour naviguer:"
+        welcome_text += "Use the menu below to navigate:"
         
         await query.edit_message_text(
             welcome_text,
@@ -548,105 +619,105 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère les messages texte (pour la saisie de l'adresse)"""
+    """Handles text messages (for address input)"""
     if context.user_data.get('waiting_for_address', False):
         user_id = str(update.effective_user.id)
         address = update.message.text.strip()
         
-        # Validation basique de l'adresse
+        # Basic address validation
         if not address.startswith('0x') or len(address) != 42:
             await update.message.reply_text(
-                "❌ <b>Format d'adresse invalide</b>\n\n"
-                "Veuillez envoyer une adresse Ethereum valide (commence par 0x et fait 42 caractères).\n\n"
-                "Exemple: <code>0xec0cf15a2857d39f9ff55bc532a977fa590e5161</code>",
+                "❌ <b>Invalid address format</b>\n\n"
+                "Please send a valid Ethereum address (starts with 0x and is 42 characters long).\n\n"
+                "Example: <code>0xec0cf15a2857d39f9ff55bc532a977fa590e5161</code>",
                 parse_mode='HTML'
             )
             return
         
-        # Sauvegarder l'adresse
+        # Save the address
         user_addresses[user_id] = address
         save_user_addresses()
         
         context.user_data['waiting_for_address'] = False
         
         keyboard = [
-            [InlineKeyboardButton("📊 Obtenir le rapport", callback_data='get_report')],
-            [InlineKeyboardButton("◀️ Retour au menu", callback_data='back_to_menu')]
+            [InlineKeyboardButton("📊 Get report", callback_data='get_report')],
+            [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            f"✅ <b>Adresse enregistrée avec succès!</b>\n\n"
-            f"Adresse: <code>{address}</code>\n\n"
-            "Vous pouvez maintenant obtenir votre rapport de performance.",
+            f"✅ <b>Address saved successfully!</b>\n\n"
+            f"Address: <code>{address}</code>\n\n"
+            "You can now get your performance report.",
             reply_markup=reply_markup,
             parse_mode='HTML'
         )
     else:
-        # Si l'utilisateur envoie un message sans contexte, afficher le menu
+        # If user sends a message without context, show the menu
         keyboard = [
-            [InlineKeyboardButton("📝 Définir mon adresse", callback_data='set_address')],
-            [InlineKeyboardButton("📊 Obtenir le rapport", callback_data='get_report')],
-            [InlineKeyboardButton("ℹ️ Voir mon adresse", callback_data='view_address')]
+            [InlineKeyboardButton("📝 Set my address", callback_data='set_address')],
+            [InlineKeyboardButton("📊 Get report", callback_data='get_report')],
+            [InlineKeyboardButton("ℹ️ View my address", callback_data='view_address')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "👋 Utilisez le menu ci-dessous pour naviguer:",
+            "👋 Use the menu below to navigate:",
             reply_markup=reply_markup,
             parse_mode='HTML'
         )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère la commande /help"""
+    """Handles the /help command"""
     help_text = """
-<b>📖 Aide - Bot HLP Performance Tracker</b>
+<b>📖 Help - HLP Performance Tracker Bot</b>
 
-<b>Commandes disponibles:</b>
-/start - Afficher le menu principal
-/help - Afficher cette aide
-/report - Obtenir votre rapport de performance (nécessite une adresse enregistrée)
+<b>Available commands:</b>
+/start - Show main menu
+/help - Show this help
+/report - Get your performance report (requires a registered address)
 
-<b>Fonctionnalités:</b>
-• Suivez votre performance dans le vault HLP d'Hyperliquid
-• Consultez votre PnL quotidien et total
-• Visualisez les métriques du vault global
+<b>Features:</b>
+• Track your performance in the Hyperliquid HLP vault
+• View your daily and total PnL
+• See global vault metrics
 
-<b>Comment utiliser:</b>
-1. Définissez votre adresse wallet via le menu
-2. Utilisez "Obtenir le rapport" pour voir vos performances
-3. Actualisez le rapport à tout moment
+<b>How to use:</b>
+1. Set your wallet address via the menu
+2. Use "Get report" to see your performance
+3. Refresh the report at any time
 
-<b>Note:</b> Si votre position n'apparaît pas, vérifiez que votre adresse est correcte et que vous avez des fonds dans le vault HLP.
+<b>Note:</b> If your position doesn't appear, please verify that your address is correct and that you have funds in the HLP vault.
 """
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère la commande /report"""
+    """Handles the /report command"""
     user_id = str(update.effective_user.id)
     current_address = user_addresses.get(user_id, None)
     
     if not current_address:
         keyboard = [
-            [InlineKeyboardButton("📝 Définir mon adresse", callback_data='set_address')]
+            [InlineKeyboardButton("📝 Set my address", callback_data='set_address')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "⚠️ <b>Aucune adresse enregistrée</b>\n\n"
-            "Veuillez d'abord définir votre adresse wallet pour obtenir votre rapport.",
+            "⚠️ <b>No address registered</b>\n\n"
+            "Please set your wallet address first to get your report.",
             reply_markup=reply_markup,
             parse_mode='HTML'
         )
         return
     
-    message = await update.message.reply_text("⏳ <b>Récupération des données...</b>", parse_mode='HTML')
+    message = await update.message.reply_text("⏳ <b>Retrieving data...</b>", parse_mode='HTML')
     
     report = await generate_report(current_address)
     
     keyboard = [
-        [InlineKeyboardButton("🔄 Actualiser", callback_data='get_report')],
-        [InlineKeyboardButton("◀️ Retour au menu", callback_data='back_to_menu')]
+        [InlineKeyboardButton("🔄 Refresh", callback_data='get_report')],
+        [InlineKeyboardButton("◀️ Back to menu", callback_data='back_to_menu')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -657,25 +728,38 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 def main():
-    """Fonction principale"""
-    print("Bot HLP Performance Tracker démarré")
+    """Main function"""
+    print("HLP Performance Tracker Bot started")
     
-    # Charger les adresses sauvegardées
+    # Load saved addresses
     load_user_addresses()
-    print(f"Adresses chargées: {len(user_addresses)} utilisateur(s)")
+    print(f"Loaded addresses: {len(user_addresses)} user(s)")
     
-    # Créer l'application Telegram
+    # Create Telegram application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Ajouter les handlers
+    # Configure bot commands for menu
+    async def post_init(app: Application) -> None:
+        """Configure bot commands after initialization"""
+        commands = [
+            BotCommand("start", "Show main menu"),
+            BotCommand("help", "Show help and instructions"),
+            BotCommand("report", "Get your HLP performance report"),
+        ]
+        await app.bot.set_my_commands(commands)
+        print("✅ Bot commands menu configured")
+    
+    application.post_init = post_init
+    
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Démarrer le bot
-    print("Bot en cours d'exécution...")
+    # Start the bot
+    print("Bot running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
