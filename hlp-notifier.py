@@ -9,12 +9,18 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 import asyncio
 
 # Configuration
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8484118476:AAH8lQzlhViyT8mEg5eWp7iaZtbDA8woSS0")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError(
+        "TELEGRAM_BOT_TOKEN environment variable is required. "
+        "Please set it in your environment or Railway settings."
+    )
+
 HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
 VAULTS_ANALYSER_API = "https://vaults-analyser.com/pub_api/v1"
 
 # Token pour vaults-analyser.com (optionnel)
-VAULTS_ANALYSER_TOKEN = os.getenv("VAULTS_ANALYSER_TOKEN", "vjtEN0sSsCOs7XCmK0YNH6912x9YrOlLkkiSV6oD0c58677f")
+VAULTS_ANALYSER_TOKEN = os.getenv("VAULTS_ANALYSER_TOKEN")
 
 # Fichier pour stocker les adresses des utilisateurs
 USER_ADDRESSES_FILE = "user_addresses.json"

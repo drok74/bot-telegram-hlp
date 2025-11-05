@@ -31,7 +31,7 @@ cd bot-telegram-hlp
 pip install -r requirements.txt
 ```
 
-3. Configurez les variables d'environnement :
+3. Configurez les variables d'environnement (obligatoire) :
 ```bash
 # Windows PowerShell
 $env:TELEGRAM_BOT_TOKEN="votre_token_telegram"
@@ -42,7 +42,7 @@ export TELEGRAM_BOT_TOKEN="votre_token_telegram"
 export VAULTS_ANALYSER_TOKEN="votre_token_vaults_analyser"  # Optionnel
 ```
 
-Ou modifiez directement les variables dans `hlp-notifier.py` (lignes 12 et 17).
+⚠️ **Important** : Le token Telegram est maintenant obligatoire et doit être configuré via les variables d'environnement. Plus aucune clé API n'est hardcodée dans le code pour des raisons de sécurité.
 
 ## 🏃 Utilisation
 
