@@ -157,21 +157,40 @@ def get_user_vault_position(wallet_address, vault_data=None):
                             vault_equity_va = float(vault_equity_va) if isinstance(vault_equity_va, str) else vault_equity_va
                             all_time_pnl_va = float(all_time_pnl_va) if isinstance(all_time_pnl_va, str) else all_time_pnl_va
                             
-                            # Calculate initial deposit: current equity - total PnL = initial deposit
-                            # But we use vault_equity_va from vaults-analyser which might differ from SDK equity
-                            # So we calculate: initial_deposit = vault_equity_va - all_time_pnl_va
-                            initial_deposit = vault_equity_va - all_time_pnl_va
+                            # Logic: current_equity = initial_deposit + total_pnl
+                            # From vaults-analyser: vault_equity_va = initial_deposit + all_time_pnl_va
+                            # So: initial_deposit = vault_equity_va - all_time_pnl_va
                             
-                            # But we should use the SDK equity (more accurate) for current value
-                            # So total PnL = current equity (SDK) - initial deposit
-                            total_pnl_calculated = equity_from_sdk - initial_deposit
+                            # Use SDK equity (more accurate) with all_time_pnl_va from vaults-analyser
+                            # This gives: initial_deposit = equity_from_sdk - all_time_pnl_va
+                            initial_deposit = equity_from_sdk - all_time_pnl_va
                             
-                            # Ensure initial_deposit is positive and reasonable
+                            # Fallback: if calculation gives negative or zero, use vault_equity_va
                             if initial_deposit <= 0:
-                                print(f"Warning: initial_deposit calculated as {initial_deposit}, using alternative calculation")
-                                # Alternative: use SDK equity and all_time_pnl_va from vaults-analyser
-                                initial_deposit = equity_from_sdk - all_time_pnl_va
-                                total_pnl_calculated = all_time_pnl_va
+                                print(f"Warning: initial_deposit from SDK={initial_deposit}, using vault_equity_va calculation")
+                                initial_deposit = vault_equity_va - all_time_pnl_va
+                            
+                            # Ensure we have a valid initial_deposit
+                            if initial_deposit <= 0:
+                                print(f"Error: Cannot calculate valid initial_deposit. vault_equity_va={vault_equity_va}, all_time_pnl_va={all_time_pnl_va}, equity_from_sdk={equity_from_sdk}")
+                                initial_deposit = None
+                            
+                            # Use all_time_pnl_va directly as total PnL (from vaults-analyser)
+                            total_pnl_calculated = all_time_pnl_va
+                            
+                            # Debug logging
+                            print(f"Debug calculation:")
+                            print(f"  equity_from_sdk (current): {equity_from_sdk}")
+                            print(f"  vault_equity_va (from vaults-analyser): {vault_equity_va}")
+                            print(f"  all_time_pnl_va (total PnL): {all_time_pnl_va}")
+                            print(f"  initial_deposit (calculated): {initial_deposit}")
+                            print(f"  total_pnl_calculated: {total_pnl_calculated}")
+                            print(f"  first_deposit_timestamp: {first_deposit_timestamp}")
+                            
+                            # Verify percentage calculation
+                            if initial_deposit and initial_deposit > 0 and total_pnl_calculated is not None:
+                                expected_percent = (total_pnl_calculated / initial_deposit) * 100
+                                print(f"  Expected percentage: {expected_percent:.2f}%")
                             
                             return {
                                 'equity': equity_from_sdk,
@@ -444,11 +463,29 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
         
         # Calculate duration since first deposit
         duration_str = format_duration_since_first_deposit(first_deposit_timestamp)
+        
+        # Try to get timestamp from vault history if not available
+        if not duration_str and vault_data and isinstance(vault_data, dict):
+            portfolio = vault_data.get('portfolio', [])
+            for period_data in portfolio:
+                if isinstance(period_data, list) and len(period_data) >= 2:
+                    period_name = period_data[0]
+                    period_info = period_data[1]
+                    if period_name == 'allTime' and isinstance(period_info, dict):
+                        pnl_history = period_info.get('pnlHistory', [])
+                        if pnl_history and len(pnl_history) > 0:
+                            # Get first timestamp from PnL history
+                            first_entry = pnl_history[0]
+                            if isinstance(first_entry, list) and len(first_entry) >= 2:
+                                first_deposit_timestamp = first_entry[0]
+                                duration_str = format_duration_since_first_deposit(first_deposit_timestamp)
+                        break
+        
         if duration_str:
             duration_line = f"• Duration since first deposit: {duration_str}"
         
         # Debug logging
-        print(f"Debug - all_time_pnl: {all_time_pnl}, initial_deposit: {initial_deposit}, first_deposit_timestamp: {first_deposit_timestamp}, equity: {user_equity}")
+        print(f"Debug - all_time_pnl: {all_time_pnl}, initial_deposit: {initial_deposit}, first_deposit_timestamp: {first_deposit_timestamp}, equity: {user_equity}, duration_str: {duration_str}")
         
         # Try to calculate initial deposit if not available but we have equity and PnL
         if initial_deposit is None and all_time_pnl is not None and user_equity > 0:
@@ -457,9 +494,11 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
                 # Estimate initial deposit: current equity - total PnL
                 initial_deposit = user_equity - all_time_pnl
                 if initial_deposit > 0:
-                    print(f"Estimated initial_deposit: {initial_deposit}")
-            except (ValueError, TypeError):
-                pass
+                    print(f"Estimated initial_deposit: {initial_deposit} (from equity={user_equity} - pnl={all_time_pnl})")
+                else:
+                    print(f"Warning: Cannot estimate initial_deposit (equity={user_equity}, pnl={all_time_pnl})")
+            except (ValueError, TypeError) as e:
+                print(f"Error estimating initial_deposit: {e}")
         
         if all_time_pnl is not None:
             try:
@@ -467,17 +506,26 @@ def format_performance_message(vault_data, user_data, user_pnl, user_pnl_percent
                 
                 if initial_deposit is not None and initial_deposit > 0:
                     initial_deposit = float(initial_deposit) if isinstance(initial_deposit, str) else initial_deposit
-                    # Calculate percentage
-                    all_time_pnl_percent = (all_time_pnl / initial_deposit) * 100
-                    total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
-                    total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} ({all_time_pnl_percent:+.2f}%)"
+                    # Calculate percentage - ensure values are valid
+                    if initial_deposit > 0 and all_time_pnl != 0:
+                        all_time_pnl_percent = (all_time_pnl / initial_deposit) * 100
+                        total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
+                        total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} ({all_time_pnl_percent:+.2f}%)"
+                        print(f"Final PnL display: {total_pnl_str}, percent={all_time_pnl_percent:.2f}%")
+                    else:
+                        # PnL is zero or initial_deposit invalid
+                        total_pnl_emoji = "➖"
+                        total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f} (0.00%)"
                 else:
                     # No initial deposit available, show PnL without percentage
                     total_pnl_emoji = "✅" if all_time_pnl > 0 else "❌" if all_time_pnl < 0 else "➖"
                     total_pnl_str = f"{total_pnl_emoji} ${all_time_pnl:,.2f}"
+                    print(f"No initial_deposit available, showing PnL only: {total_pnl_str}")
             except (ValueError, TypeError) as e:
                 print(f"Error formatting PnL: {e}, all_time_pnl={all_time_pnl}, initial_deposit={initial_deposit}")
                 total_pnl_str = "N/A"
+        else:
+            total_pnl_str = "N/A"
     
     # Build message with duration on separate line
     message = f"""
